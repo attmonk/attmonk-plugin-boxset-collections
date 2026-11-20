@@ -1,0 +1,408 @@
+package boxsets
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"maps"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/neilmc78/silo-plugin-boxset-collections/internal/silo"
+	"github.com/neilmc78/silo-plugin-boxset-collections/internal/tvdb"
+)
+
+// Series franchises come from TheTVDB's official lists: a list with enough
+// of a library's series becomes a collection in that library's
+// "Franchises" group. They are synced only when the install has its own
+// TheTVDB key. Collections hold series only; movies on a list are left out.
+// Every collection credits TheTVDB.com and links to the list's page, as
+// TheTVDB's free API tier requires.
+const (
+	franchiseSlugPrefix = "tvdb-list-"
+	franchiseGroupSlug  = "franchises"
+
+	// seriesRecheck is how old a series' list lookup may be before a full
+	// sync looks it up again; quick syncs look up only new or refreshed
+	// series.
+	seriesRecheck = 7 * 24 * time.Hour
+	// listRefetch is how long a list's details are reused.
+	listRefetch = 7 * 24 * time.Hour
+
+	tvdbArtworkBase = "https://artworks.thetvdb.com"
+)
+
+// TVDB is the part of TheTVDB's API the series sync uses; *tvdb.Client is
+// it.
+type TVDB interface {
+	SeriesLists(ctx context.Context, seriesID string) ([]tvdb.ListRef, error)
+	List(ctx context.Context, id string) (tvdb.List, error)
+}
+
+func (s *Syncer) seriesKind(cfg Config) collectionKind {
+	return collectionKind{
+		slugPrefix: franchiseSlugPrefix, groupSlug: franchiseGroupSlug, groupName: cfg.SeriesGroupName, noun: "franchise",
+		excluded: func(id string) bool { return cfg.Excluded(id) || (s.state != nil && s.state.excluding[id]) },
+		excludeOnDelete: func(id string) {
+			if s.state != nil {
+				s.state.excluding[id] = true
+			}
+		},
+	}
+}
+
+// tvdbClient returns the TheTVDB client for the configured key, kept across
+// syncs so its login token is reused.
+func (s *Syncer) tvdbClient(cfg Config) TVDB {
+	key := cfg.TVDBAPIKey + "\x00" + cfg.TVDBPin
+	if s.tvdb == nil || s.tvdbFor != key {
+		s.tvdb, s.tvdbFor = s.newTVDB(cfg.TVDBAPIKey, cfg.TVDBPin), key
+	}
+	return s.tvdb
+}
+
+// syncSeries brings every series library's franchise collections in line
+// with TheTVDB's official lists. Only a cancelled context stops it; other
+// failures are reported per library.
+func (s *Syncer) syncSeries(ctx context.Context, api API, cfg Config, full bool, stale map[string]bool, report *Report) error {
+	libraries, err := s.host.SeriesLibraries(ctx)
+	if err != nil {
+		report.Errors = append(report.Errors, "listing series libraries: "+err.Error())
+		return nil
+	}
+	tv := s.tvdbClient(cfg)
+	defer s.pruneLists()
+	lists := map[string]listResult{} // read once per sync, shared by libraries
+	for _, lib := range libraries {
+		if err := s.syncSeriesLibrary(ctx, api, tv, cfg, lib, full, stale, lists, report); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			report.Errors = append(report.Errors, fmt.Sprintf("%s: %v", lib.Name, err))
+			s.log.Warn("box set collections: series library sync failed", "library", lib.Name, "error", err)
+			continue
+		}
+		report.SeriesLibraries++
+	}
+	return nil
+}
+
+type listResult struct {
+	list tvdb.List
+	err  error
+}
+
+func (s *Syncer) syncSeriesLibrary(ctx context.Context, api API, tv TVDB, cfg Config, lib Library, full bool,
+	stale map[string]bool, lists map[string]listResult, report *Report) error {
+	series, err := api.Series(ctx, lib.ID)
+	if err != nil {
+		return fmt.Errorf("listing series: %w", err)
+	}
+	// byTVDB maps a TheTVDB ID to the library's series; the first of two
+	// series sharing one ID wins.
+	byTVDB := map[string]string{}
+	for _, sr := range series {
+		if sr.TvdbID == "" {
+			report.SeriesWithoutTVDB++
+			continue
+		}
+		if _, dup := byTVDB[sr.TvdbID]; !dup {
+			byTVDB[sr.TvdbID] = sr.ContentID
+		}
+	}
+
+	// Which official lists each series is on, looked up only when new,
+	// refreshed, rematched, or (on a full sync) a week old.
+	cache, err := s.loadCache(ctx, seriesCache, lib.ID)
+	if err != nil {
+		return err
+	}
+	now := s.now()
+	next := make(map[string]string, len(byTVDB))
+	failed := 0
+	for _, tvdbID := range sortedKeys(byTVDB) {
+		contentID := byTVDB[tvdbID]
+		entry, cached := cache[contentID]
+		checked, cachedID, _, _ := parseSeriesEntry(entry)
+		if cached && cachedID == tvdbID && !stale[contentID] && !stale[lib.ID] && (!full || now.Sub(checked) < seriesRecheck) {
+			next[contentID] = entry
+			continue
+		}
+		refs, err := tv.SeriesLists(ctx, tvdbID)
+		if errors.Is(err, tvdb.ErrNotFound) {
+			refs, err = nil, nil
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if cached && cachedID == tvdbID {
+				next[contentID] = entry
+			}
+			failed++
+			report.addError(lib, "looking up the TheTVDB lists of series %s: %v", tvdbID, err)
+			continue
+		}
+		report.SeriesLooked++
+		var official, unofficial []string
+		for _, r := range refs {
+			if r.Official {
+				official = append(official, r.ID)
+			} else {
+				unofficial = append(unofficial, r.ID)
+			}
+		}
+		next[contentID] = formatSeriesEntry(now, tvdbID, official, unofficial)
+		if report.SeriesLooked%cacheSaveEvery == 0 {
+			partial := maps.Clone(cache)
+			maps.Copy(partial, next)
+			if err := s.saveCache(ctx, seriesCache, lib.ID, partial); err != nil {
+				return err
+			}
+		}
+	}
+	if err := s.saveCache(ctx, seriesCache, lib.ID, next); err != nil {
+		return err
+	}
+
+	// The lists that form a franchise in this library. Unofficial lists
+	// are only counted, so the task can say when they are all there is.
+	listIDs := map[string]bool{}
+	unofficialIDs := map[string]bool{}
+	for _, entry := range next {
+		_, _, official, unofficial := parseSeriesEntry(entry)
+		for _, id := range official {
+			listIDs[id] = true
+		}
+		for _, id := range unofficial {
+			unofficialIDs[id] = true
+		}
+	}
+	report.ListsOfficial += len(listIDs)
+	report.ListsUnofficial += len(unofficialIDs)
+	tooSmall := 0
+	want := map[string]silo.BoxSet{}
+	unreadable := map[string]bool{}
+	for _, id := range sortedKeys(listIDs) {
+		r, ok := lists[id]
+		if !ok {
+			l, err := s.cachedList(ctx, tv, id)
+			r = listResult{list: l, err: err}
+			lists[id] = r
+		}
+		if errors.Is(r.err, tvdb.ErrNotFound) {
+			continue
+		}
+		if r.err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			unreadable[id] = true
+			failed++
+			report.addError(lib, "reading TheTVDB list %s: %v", id, r.err)
+			continue
+		}
+		if b, ok := franchiseOf(r.list, byTVDB, cfg.SeriesMinShows); ok {
+			want[id] = b
+		} else {
+			// A list with fewer series in all than the minimum can never
+			// form (a film franchise with one spin-off series, say), so it
+			// is counted but not named as a near miss.
+			if miss := nearMissOf(r.list, byTVDB, cfg.SeriesMinShows); miss.Series < miss.Needed {
+				report.ListsNeverForm++
+			} else {
+				tooSmall++
+				report.addNearMiss(miss)
+			}
+		}
+	}
+	report.Franchises += len(want)
+	report.ListsTooSmall += tooSmall
+	s.log.Info("box set collections: series library checked", "library", lib.Name,
+		"series", len(series), "without_tvdb_id", len(series)-len(byTVDB), "official_lists", len(listIDs),
+		"unofficial_lists", len(unofficialIDs), "lists_too_small", tooSmall, "franchises", len(want))
+
+	confirmGone := func(id string) (bool, error) {
+		// Only TheTVDB's current answer for this list removes its
+		// collection: gone, no longer official, or too few series.
+		l, err := tv.List(ctx, id)
+		switch {
+		case errors.Is(err, tvdb.ErrNotFound):
+			return true, nil
+		case err != nil:
+			return false, fmt.Errorf("could not confirm its TheTVDB list is gone: %w", err)
+		}
+		s.saveList(ctx, l)
+		if _, ok := franchiseOf(l, byTVDB, cfg.SeriesMinShows); ok {
+			return false, errors.New("its TheTVDB list still qualifies, though no series lookup found it")
+		}
+		return true, nil
+	}
+	return s.apply(ctx, api, lib, s.seriesKind(cfg), want, unreadable, failed, confirmGone, report)
+}
+
+// franchiseOf turns a list into a collection for a library: the list's
+// series the library has, in list order, when it is official and the
+// library has at least minShows of them.
+func franchiseOf(l tvdb.List, byTVDB map[string]string, minShows int) (silo.BoxSet, bool) {
+	if !l.Official || l.Name == "" {
+		return silo.BoxSet{}, false
+	}
+	var members []string
+	seen := map[string]bool{}
+	for _, id := range l.SeriesIDs {
+		if c, ok := byTVDB[id]; ok && !seen[c] {
+			seen[c] = true
+			members = append(members, c)
+		}
+	}
+	if len(members) < max(minShows, 2) {
+		return silo.BoxSet{}, false
+	}
+	return silo.BoxSet{
+		ID: l.ID, Title: l.Name, Overview: attributed(l.Overview, l.PageURL()),
+		PosterURL: artworkURL(l.Image), Members: members,
+	}, true
+}
+
+// NearMiss is a list read for a library that did not become a franchise,
+// with why: how many of the library's series it matched against how many
+// it needed, and how many series the list has at all.
+type NearMiss struct {
+	ListID   string
+	Name     string
+	Matched  int
+	Series   int
+	Needed   int
+	Official bool
+}
+
+func (n NearMiss) String() string {
+	s := fmt.Sprintf("%s (%s) matched %d of your series (list has %d series; needs %d)", n.Name, n.ListID, n.Matched, n.Series, n.Needed)
+	if !n.Official {
+		s += ", and TheTVDB says the list is not official"
+	}
+	return s
+}
+
+func nearMissOf(l tvdb.List, byTVDB map[string]string, minShows int) NearMiss {
+	matched := 0
+	for _, id := range l.SeriesIDs {
+		if _, ok := byTVDB[id]; ok {
+			matched++
+		}
+	}
+	return NearMiss{ListID: l.ID, Name: l.Name, Matched: matched, Series: len(l.SeriesIDs), Needed: max(minShows, 2), Official: l.Official}
+}
+
+// maxNearMisses is how many near misses a report keeps: the closest ones.
+const maxNearMisses = 10
+
+func (r *Report) addNearMiss(n NearMiss) {
+	r.NearMisses = append(r.NearMisses, n)
+	sort.SliceStable(r.NearMisses, func(i, j int) bool { return r.NearMisses[i].Matched > r.NearMisses[j].Matched })
+	if len(r.NearMisses) > maxNearMisses {
+		r.NearMisses = r.NearMisses[:maxNearMisses]
+	}
+}
+
+// attributed adds the credit and link TheTVDB's free API tier requires to
+// a collection's description, which is where viewers see the list's data.
+func attributed(overview, page string) string {
+	credit := "Source: TheTVDB.com (" + page + ")"
+	if overview = strings.TrimSpace(overview); overview == "" {
+		return credit
+	}
+	return overview + "\n\n" + credit
+}
+
+// artworkURL makes a TheTVDB image address absolute; TheTVDB may give a
+// path on its artwork host.
+func artworkURL(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" || strings.HasPrefix(image, "https://") || strings.HasPrefix(image, "http://") {
+		return image
+	}
+	return tvdbArtworkBase + "/" + strings.TrimLeft(image, "/")
+}
+
+// A series cache entry is "<checked unix>|<tvdb id>|<official list ids>|
+// <unofficial list ids>", the IDs comma separated. The TheTVDB ID is kept
+// so a rematched series is looked up again.
+func formatSeriesEntry(checked time.Time, tvdbID string, official, unofficial []string) string {
+	sort.Strings(official)
+	sort.Strings(unofficial)
+	return strconv.FormatInt(checked.Unix(), 10) + "|" + tvdbID + "|" + strings.Join(official, ",") + "|" + strings.Join(unofficial, ",")
+}
+
+func parseSeriesEntry(entry string) (checked time.Time, tvdbID string, official, unofficial []string) {
+	parts := strings.SplitN(entry, "|", 4)
+	if len(parts) != 4 {
+		return time.Time{}, "", nil, nil
+	}
+	if unix, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+		checked = time.Unix(unix, 0)
+	}
+	if parts[2] != "" {
+		official = strings.Split(parts[2], ",")
+	}
+	if parts[3] != "" {
+		unofficial = strings.Split(parts[3], ",")
+	}
+	return checked, parts[1], official, unofficial
+}
+
+type storedList struct {
+	List    tvdb.List `json:"list"`
+	Fetched int64     `json:"fetched"`
+}
+
+// cachedList returns a list's details, reusing a copy younger than
+// listRefetch, on full syncs too: lists change rarely, and each
+// request spends the install's own TheTVDB allowance.
+func (s *Syncer) cachedList(ctx context.Context, tv TVDB, id string) (tvdb.List, error) {
+	if s.state != nil {
+		var stored storedList
+		if raw, ok := s.state.lists[id]; ok && json.Unmarshal([]byte(raw), &stored) == nil && s.now().Sub(time.Unix(stored.Fetched, 0)) < listRefetch {
+			return stored.List, nil
+		}
+	}
+	l, err := tv.List(ctx, id)
+	if err != nil {
+		return tvdb.List{}, err
+	}
+	s.saveList(ctx, l)
+	return l, nil
+}
+
+func (s *Syncer) saveList(_ context.Context, l tvdb.List) {
+	if s.state == nil {
+		return
+	}
+	raw, err := json.Marshal(storedList{List: l, Fetched: s.now().Unix()})
+	if err != nil {
+		return
+	}
+	s.state.set(listsMap, s.state.lists, l.ID, string(raw))
+}
+
+// listForget is how long an unused list's details are kept: lists still
+// in use are fetched again weekly, so older entries belong to lists no
+// series is on any more.
+const listForget = 30 * 24 * time.Hour
+
+// pruneLists drops list details no sync has fetched for listForget.
+func (s *Syncer) pruneLists() {
+	if s.state == nil {
+		return
+	}
+	for id, raw := range s.state.lists {
+		var stored storedList
+		if json.Unmarshal([]byte(raw), &stored) != nil || s.now().Sub(time.Unix(stored.Fetched, 0)) > listForget {
+			s.state.drop(listsMap, s.state.lists, id)
+		}
+	}
+}

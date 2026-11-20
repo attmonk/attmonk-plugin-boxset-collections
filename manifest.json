@@ -1,0 +1,219 @@
+{
+  "plugin_id": "neilmc78.collections.boxsets",
+  "version": "1.1.4",
+  "checksum": "__CHECKSUM__",
+  "silo_api_version": "v1",
+  "category": "Collections",
+  "presentation": {
+    "display_name": "Box Set Collections",
+    "summary": "Shows every movie box set, and TV franchises from TheTVDB, as collections kept in step with your library.",
+    "description_markdown": "Silo already groups franchise movies into box sets, with the collection's poster, backdrop and overview, but shows them only on a movie's page and in search. This plugin gives each box set a matching collection in a **Box Sets** group under the library's Collections, so franchises appear wherever collections do: the Collections tab, collection rows on Home, and Jellyfin apps.\n\n- **No extra TMDB requests.** It reads only the box set data Silo already stores.\n- **Stays in step.** After a library scan or a metadata refresh, and on its schedule, it adds and removes movies, and removes a collection once its box set no longer forms (too few movies, or box sets turned off for the library).\n- **Your changes stay.** Visibility, featuring, placement and any poster or backdrop you upload are left alone. The plugin owns each collection's title, description and movies, and keeps the box set's artwork up to date until you replace it.\n\nThe collections follow what the API key's primary profile can see, so use an account whose primary profile has no rating or library limits.\n\n**TV franchises (optional).** With your own free TheTVDB API key, each series library also gets a **Franchises** group: one collection per official TheTVDB list that holds at least two of the library's series (for example Yellowstone), with the shows in list order. Collections hold series only. Each franchise collection's description credits TheTVDB.com and links to the list's page.\n\nSeries franchise data is provided by [TheTVDB.com](https://thetvdb.com). Please consider adding missing information or subscribing.",
+    "setup_markdown": "1. In **Admin → API Keys**, create a key with no scopes for the server Owner account (or another administrator); Silo has no narrower scope for collections. The account's primary profile must have no rating or library limits, because the collections show what it can see. Profile PINs don't matter: API keys skip them.\n2. Paste the key under this plugin's **Settings → Silo connection**.\n3. For movie box sets: leave **Movie box sets** on, and turn on **Box sets** in each movie library's settings (Metadata), if it isn't on already.\n4. For TV franchises: get your own free API key from [TheTVDB.com](https://thetvdb.com/api-information) (choose the free tier for projects under $50k a year; name the project after your server, for example \"Silo Box Set Collections on my home server\"). Leave **TV Franchises via theTVDB.com** on and paste the key in **TheTVDB options**. Each server uses its own key; the plugin ships none.\n5. Restart Silo (restart its container or service): Silo lists a plugin's scheduled tasks only at startup, and the restart runs the first sync. A first sync on a large library takes a few minutes.\n6. In **Admin → Scheduled Tasks**, give **Sync box set collections (neilmc78.collections.boxsets)** a daily schedule. It is not Silo's own \"Sync Movie Box Sets\". After that it also runs by itself shortly after library scans and metadata refreshes. The **Last sync** box on this page shows what each sync did.",
+    "homepage_url": "https://github.com/neilmc78/silo-plugin-boxset-collections",
+    "source_url": "https://github.com/neilmc78/silo-plugin-boxset-collections",
+    "support_url": "https://github.com/neilmc78/silo-plugin-boxset-collections/issues",
+    "changelog_url": "https://github.com/neilmc78/silo-plugin-boxset-collections/releases",
+    "publisher_name": "neilmc78",
+    "publisher_url": "https://github.com/neilmc78",
+    "license_spdx": "AGPL-3.0-or-later"
+  },
+  "supported_platforms": [
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    }
+  ],
+  "global_config_schema": [
+    {
+      "key": "settings",
+      "title": "Settings",
+      "description": "How the plugin reaches Silo, and which collections it makes.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"api_key\":{\"type\":\"string\",\"writeOnly\":true},\"group_name\":{\"type\":\"string\"},\"silo_url\":{\"type\":\"string\"},\"tv_franchises\":{\"type\":\"boolean\"},\"tvdb_api_key\":{\"type\":\"string\",\"writeOnly\":true},\"tvdb_pin\":{\"type\":\"string\",\"writeOnly\":true},\"series_group_name\":{\"type\":\"string\"},\"series_min_shows\":{\"type\":\"integer\",\"minimum\":2,\"maximum\":20},\"movie_box_sets\":{\"type\":\"boolean\"},\"excluded_tvdb_lists\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+      "required": true,
+      "admin_form": {
+        "submit_label": "Save settings",
+        "fields": [
+          {
+            "key": "api_key",
+            "label": "API key",
+            "description": "An unscoped Silo API key of the Owner or another administrator account; the plugin creates and updates collections with it. Required for the plugin to do anything. Stored encrypted; leave blank to keep the saved key.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
+          },
+          {
+            "key": "silo_url",
+            "label": "Silo URL (optional)",
+            "description": "Only if the plugin cannot reach Silo on the address the server reports for itself, for example http://localhost:8080.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "http://localhost:8080"
+          },
+          {
+            "key": "movie_box_sets",
+            "label": "Movie box sets",
+            "description": "Make a collection for each box set Silo forms in your movie libraries. Box sets must also be on in each movie library's settings (Metadata → Box sets).",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": true
+          },
+          {
+            "key": "group_name",
+            "label": "Group name",
+            "description": "The collection group box sets go in, in each movie library. Changing it renames the group on the next sync.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "Box Sets",
+            "placeholder": "Box Sets"
+          },
+          {
+            "key": "tv_franchises",
+            "label": "TV Franchises via theTVDB.com",
+            "description": "Make a collection for each official TheTVDB list that holds enough of your series, such as the Yellowstone shows. Series libraries need no setting of their own in Silo. Data provided by TheTVDB.com.",
+            "control": "ADMIN_FORM_CONTROL_SWITCH",
+            "default_value": true
+          },
+          {
+            "key": "tvdb_api_key",
+            "label": "TheTVDB API key",
+            "description": "Your own free key from thetvdb.com. Stored encrypted.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
+          },
+          {
+            "key": "tvdb_pin",
+            "label": "TheTVDB PIN (optional)",
+            "description": "Only for a TheTVDB subscriber key that comes with a PIN. Leave empty for a free project key.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
+          },
+          {
+            "key": "series_group_name",
+            "label": "Franchise group name",
+            "description": "The collection group TV franchises go in, in each series library with a franchise. Changing it renames the group on the next sync.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "default_value": "Franchises",
+            "placeholder": "Franchises"
+          },
+          {
+            "key": "series_min_shows",
+            "label": "Minimum series per franchise",
+            "description": "How many of a TheTVDB list's series a library needs before the list becomes a collection there (2 to 20).",
+            "control": "ADMIN_FORM_CONTROL_NUMBER",
+            "default_value": 2,
+            "placeholder": "2"
+          },
+          {
+            "key": "excluded_tvdb_lists",
+            "label": "Excluded TheTVDB lists",
+            "description": "TheTVDB list IDs never to make into collections, separated by commas. Deleting a franchise collection adds its list here; remove an ID to bring the collection back on the next sync.",
+            "control": "ADMIN_FORM_CONTROL_TEXT",
+            "placeholder": "e.g. 7502, 1234"
+          }
+        ],
+        "sections": [
+          {
+            "key": "silo",
+            "title": "Silo connection",
+            "field_keys": [
+              "api_key",
+              "silo_url"
+            ]
+          },
+          {
+            "key": "movies",
+            "title": "Movie box sets",
+            "field_keys": [
+              "movie_box_sets"
+            ]
+          },
+          {
+            "key": "movie_options",
+            "title": "Box set options",
+            "collapsible": true,
+            "collapsed_default": false,
+            "field_keys": [
+              "group_name"
+            ],
+            "show_when": [
+              {
+                "field": "movie_box_sets",
+                "equals": [
+                  "true"
+                ]
+              }
+            ]
+          },
+          {
+            "key": "tv",
+            "title": "TV Franchises via theTVDB.com",
+            "field_keys": [
+              "tv_franchises"
+            ]
+          },
+          {
+            "key": "tvdb_options",
+            "title": "TheTVDB options",
+            "collapsible": true,
+            "collapsed_default": false,
+            "field_keys": [
+              "tvdb_api_key",
+              "tvdb_pin",
+              "series_group_name",
+              "series_min_shows",
+              "excluded_tvdb_lists"
+            ],
+            "show_when": [
+              {
+                "field": "tv_franchises",
+                "equals": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "key": "status",
+      "title": "Last sync",
+      "description": "Written by the plugin at the start and end of every sync: what it found and why franchises did or did not form. Edits here are overwritten.",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"report\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+      "required": false,
+      "admin_form": {
+        "submit_label": "Save",
+        "fields": [
+          {
+            "key": "report",
+            "label": "Report",
+            "description": "Reload this page to see the latest sync.",
+            "control": "ADMIN_FORM_CONTROL_TEXTAREA"
+          }
+        ]
+      }
+    }
+  ],
+  "capabilities": [
+    {
+      "type": "scheduled_task.v1",
+      "id": "sync",
+      "display_name": "Sync box set collections",
+      "description": "Brings every movie library's box set collections in line with its box sets, and every series library's franchises in line with TheTVDB when a TheTVDB key is set.",
+      "metadata": {
+        "display_name": "Sync box set collections",
+        "description": "Brings every movie library's box set collections in line with its box sets, and every series library's franchises in line with TheTVDB when a TheTVDB key is set."
+      }
+    },
+    {
+      "type": "event_consumer.v1",
+      "id": "library-changes",
+      "display_name": "Library changes",
+      "description": "Updates box set collections shortly after a library scan or a metadata refresh.",
+      "subscriptions": [
+        "scan_complete",
+        "metadata_updated"
+      ]
+    }
+  ]
+}
